@@ -1,26 +1,18 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
-import { createWorker } from 'tesseract.js'
-import type { Worker as TesseractWorker } from 'tesseract.js'
 import type { SavedItem } from '../App'
 import { extractBatchNumber } from '../utils/extractBatchNumber'
 import type { BatchExtractionResult } from '../utils/extractBatchNumber'
-
-// Configurable threshold for binarization (0-255). 
-// Pixels darker than this become black; lighter become white.
-const BINARIZATION_THRESHOLD = 180
 
 interface Props {
   onSaveItem: (item: SavedItem) => void
 }
 
-type OcrStatus = 'idle' | 'initializing' | 'scanning' | 'done' | 'error'
+type OcrStatus = 'idle' | 'scanning' | 'done' | 'error'
 
 export default function CameraScanner({ onSaveItem }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const workerRef = useRef<TesseractWorker | null>(null)
-  const workerInitPromise = useRef<Promise<TesseractWorker> | null>(null)
 
   const [isStreaming, setIsStreaming] = useState(false)
   const [capturedImage, setCapturedImage] = useState<string | null>(null)
@@ -31,69 +23,47 @@ export default function CameraScanner({ onSaveItem }: Props) {
 
   // OCR state
   const [ocrStatus, setOcrStatus] = useState<OcrStatus>('idle')
-  const [ocrProgress, setOcrProgress] = useState(0)
   const [ocrRawText, setOcrRawText] = useState('')
   const [batchConfidence, setBatchConfidence] = useState<BatchExtractionResult['confidence']>('low')
 
-  /* ── Initialize Tesseract Worker (once on mount) ───────── */
-  const initWorker = useCallback(async (): Promise<TesseractWorker> => {
-    // Reuse existing worker if ready
-    if (workerRef.current) return workerRef.current
-
-    // Reuse in-flight promise if already initializing
-    if (workerInitPromise.current) return workerInitPromise.current
-
-    setOcrStatus('initializing')
-
-    const promise = createWorker('eng', undefined, {
-      logger: (m) => {
-        if (m.status === 'recognizing text') {
-          setOcrProgress(Math.round(m.progress * 100))
-        }
-      },
-    })
-
-    workerInitPromise.current = promise
-
-    try {
-      const worker = await promise
-      workerRef.current = worker
-      workerInitPromise.current = null
-      setOcrStatus('idle')
-      return worker
-    } catch {
-      workerInitPromise.current = null
-      setOcrStatus('error')
-      throw new Error('Failed to initialize OCR engine')
-    }
-  }, [])
-
-  /* ── Run OCR on Canvas ─────────────────────────────────── */
+  /* ── Run OCR on Canvas via Vercel Backend ─────────────── */
   const runOcr = useCallback(
     async (canvas: HTMLCanvasElement) => {
       setOcrStatus('scanning')
-      setOcrProgress(0)
       setOcrRawText('')
       setBatchConfidence('low')
 
       try {
-        const worker = await initWorker()
-        const {
-          data: { text },
-        } = await worker.recognize(canvas)
+        const blob = await new Promise<Blob | null>((resolve) => 
+          canvas.toBlob(resolve, 'image/jpeg', 0.85)
+        )
+        
+        if (!blob) throw new Error('Failed to create image blob')
+        
+        // Proxy the request through our Vercel Serverless Function
+        const res = await fetch('/api/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: blob
+        })
 
-        const cleaned = text.trim()
+        if (!res.ok) {
+          const errorData = await res.json()
+          throw new Error(errorData.error || 'Failed to analyze image')
+        }
+
+        const data = await res.json()
+        const lines: string[] = data.lines || []
+        const cleaned = lines.join('\n').trim()
+
         setOcrRawText(cleaned)
         setOcrStatus('done')
 
         // Auto-fill product name with the first non-empty line
         if (cleaned) {
-          const lines = cleaned
-            .split('\n')
-            .map((l) => l.trim())
-            .filter(Boolean)
-          if (lines.length > 0) {
-            setProductName(lines[0])
+          const nonEmptyLines = lines.map((l) => l.trim()).filter(Boolean)
+          if (nonEmptyLines.length > 0) {
+            setProductName(nonEmptyLines[0])
           }
 
           // Extract batch number from OCR text
@@ -108,7 +78,7 @@ export default function CameraScanner({ onSaveItem }: Props) {
         setOcrStatus('error')
       }
     },
-    [initWorker]
+    []
   )
 
   /* ── Start Camera ──────────────────────────────────────── */
@@ -164,33 +134,10 @@ export default function CameraScanner({ onSaveItem }: Props) {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
+    // Draw the current video frame to the canvas
     ctx.drawImage(video, 0, 0)
-
-    // --- Image Preprocessing Pipeline ---
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-    const data = imageData.data
-
-    for (let i = 0; i < data.length; i += 4) {
-      // 1. Grayscale conversion using luminance weights
-      const r = data[i]
-      const g = data[i + 1]
-      const b = data[i + 2]
-      const gray = 0.299 * r + 0.587 * g + 0.114 * b
-
-      // 2. Binarization / Thresholding
-      const color = gray < BINARIZATION_THRESHOLD ? 0 : 255
-
-      // 3. Apply to pixel array
-      data[i] = color     // Red
-      data[i + 1] = color // Green
-      data[i + 2] = color // Blue
-      // Alpha (data[i + 3]) is left untouched (255)
-    }
-
-    // Put the modified high-contrast image back onto the canvas
-    ctx.putImageData(imageData, 0, 0)
-    // ------------------------------------
-
+    
+    // Save as thumbnail
     const dataUrl = canvas.toDataURL('image/jpeg', 0.85)
     setCapturedImage(dataUrl)
 
@@ -207,7 +154,6 @@ export default function CameraScanner({ onSaveItem }: Props) {
     setBatchNo('')
     setBatchConfidence('low')
     setOcrStatus('idle')
-    setOcrProgress(0)
     setOcrRawText('')
     startCamera()
   }, [startCamera])
@@ -237,7 +183,6 @@ export default function CameraScanner({ onSaveItem }: Props) {
       setBatchNo('')
       setBatchConfidence('low')
       setOcrStatus('idle')
-      setOcrProgress(0)
       setOcrRawText('')
       startCamera()
     }, 600)
@@ -245,31 +190,19 @@ export default function CameraScanner({ onSaveItem }: Props) {
 
   /* ── Lifecycle ─────────────────────────────────────────── */
   useEffect(() => {
-    // Pre-warm the Tesseract worker on mount
-    initWorker().catch(() => {})
     startCamera()
-
-    return () => {
-      stopCamera()
-      // Terminate worker on unmount
-      if (workerRef.current) {
-        workerRef.current.terminate()
-        workerRef.current = null
-      }
-    }
-  }, [startCamera, stopCamera, initWorker])
+    return () => stopCamera()
+  }, [startCamera, stopCamera])
 
   /* ── OCR status label helper ───────────────────────────── */
   const ocrLabel = (() => {
     switch (ocrStatus) {
-      case 'initializing':
-        return 'Loading OCR engine…'
       case 'scanning':
-        return `Scanning… ${ocrProgress}%`
+        return 'Processing via secure proxy…'
       case 'done':
         return ocrRawText ? 'Text detected' : 'No text found'
       case 'error':
-        return 'OCR failed'
+        return 'Analysis failed'
       default:
         return null
     }
@@ -343,7 +276,7 @@ export default function CameraScanner({ onSaveItem }: Props) {
           )}
 
           {/* ── Scanning Overlay ───────────────────────── */}
-          {capturedImage && (ocrStatus === 'scanning' || ocrStatus === 'initializing') && (
+          {capturedImage && ocrStatus === 'scanning' && (
             <div className="absolute inset-0 bg-surface-950/60 backdrop-blur-[2px] flex flex-col items-center justify-center gap-3 animate-fade-in pointer-events-none z-10">
               {/* Animated scanner ring */}
               <div className="relative w-16 h-16">
@@ -371,21 +304,13 @@ export default function CameraScanner({ onSaveItem }: Props) {
               </div>
               <div className="text-center">
                 <p className="text-sm font-semibold text-white">
-                  {ocrStatus === 'initializing' ? 'Loading OCR engine…' : 'Scanning…'}
+                  Processing via secure proxy…
                 </p>
-                {ocrStatus === 'scanning' && (
-                  <div className="mt-2 w-36 mx-auto">
-                    <div className="h-1 rounded-full bg-white/10 overflow-hidden">
-                      <div
-                        className="h-full rounded-full bg-gradient-to-r from-primary-500 to-primary-400 transition-all duration-300 ease-out"
-                        style={{ width: `${ocrProgress}%` }}
-                      />
-                    </div>
-                    <p className="mt-1 text-[10px] text-surface-400 font-mono">
-                      {ocrProgress}%
-                    </p>
+                <div className="mt-2 w-36 mx-auto">
+                  <div className="h-1 rounded-full bg-white/10 overflow-hidden relative">
+                    <div className="absolute top-0 bottom-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-primary-400 to-transparent animate-[slideRight_1s_ease-in-out_infinite]" />
                   </div>
-                )}
+                </div>
               </div>
             </div>
           )}
@@ -455,7 +380,7 @@ export default function CameraScanner({ onSaveItem }: Props) {
           <div className="flex justify-center mt-2.5 animate-fade-in">
             <span
               className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold tracking-wide ${
-                ocrStatus === 'scanning' || ocrStatus === 'initializing'
+                ocrStatus === 'scanning'
                   ? 'bg-primary-500/10 text-primary-400 border border-primary-500/20'
                   : ocrStatus === 'done' && ocrRawText
                     ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
@@ -464,7 +389,7 @@ export default function CameraScanner({ onSaveItem }: Props) {
                       : 'bg-red-500/10 text-red-400 border border-red-500/20'
               }`}
             >
-              {(ocrStatus === 'scanning' || ocrStatus === 'initializing') && (
+              {ocrStatus === 'scanning' && (
                 <span className="w-1.5 h-1.5 rounded-full bg-primary-400 animate-pulse" />
               )}
               {ocrStatus === 'done' && ocrRawText && (
@@ -489,7 +414,7 @@ export default function CameraScanner({ onSaveItem }: Props) {
             Product Name
             {ocrStatus === 'done' && ocrRawText && (
               <span className="ml-2 normal-case tracking-normal text-[10px] text-emerald-400/80 font-medium">
-                ✦ auto-filled by OCR
+                ✦ auto-filled by Azure
               </span>
             )}
           </label>
@@ -615,6 +540,13 @@ export default function CameraScanner({ onSaveItem }: Props) {
           </button>
         </div>
       </div>
+
+      <style>{`
+        @keyframes slideRight {
+          0% { left: -33%; }
+          100% { left: 100%; }
+        }
+      `}</style>
     </div>
   )
 }
